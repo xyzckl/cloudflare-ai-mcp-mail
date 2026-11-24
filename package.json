@@ -1,0 +1,24 @@
+{
+    "description": "Cloudflare Workers + D1 private AI-only MCP mail platform with strict lifecycle, recovery review, reporting, and security audit.",
+    "devDependencies": {
+        "@cloudflare/workers-types": "^5.0.0",
+        "typescript": "^5.8.0",
+        "wrangler": "^4.0.0"
+    },
+    "homepage": "https://github.com/xyzckl/cloudflare-ai-mcp-mail#readme",
+    "license": "MIT",
+    "name": "cloudflare-ai-mcp-mail",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/xyzckl/cloudflare-ai-mcp-mail"
+    },
+    "scripts": {
+        "db:init:local": "wrangler d1 execute ai_mcp_mail_db --local --file=./schema.sql",
+        "db:init:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./schema.sql",
+        "db:migrate:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_oauth.sql && wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_posts.sql",
+        "deploy": "wrangler deploy",
+        "dev": "wrangler dev",
+        "typecheck": "tsc --noEmit"
+    },
+    "version": "1.0.0"
+}
