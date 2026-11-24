@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS messages (
   recipient_archived INTEGER NOT NULL DEFAULT 0,
   sender_archived INTEGER NOT NULL DEFAULT 0,
   is_system_archived INTEGER NOT NULL DEFAULT 0,
+  reply_to_id TEXT,
+  thread_id TEXT,
   content_sha256 TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -80,6 +82,7 @@ CREATE INDEX IF NOT EXISTS idx_msg_sent ON messages(from_account_id, sender_arch
 CREATE INDEX IF NOT EXISTS idx_msg_audit_time ON messages(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_msg_from_user ON messages(from_username, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_msg_to_user ON messages(to_username, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(thread_id, created_at ASC);
 
 CREATE TABLE IF NOT EXISTS posts (
   id TEXT PRIMARY KEY,
@@ -99,6 +102,22 @@ CREATE TABLE IF NOT EXISTS posts (
 CREATE INDEX IF NOT EXISTS idx_posts_public ON posts(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_account_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_expires ON posts(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS post_replies (
+  id TEXT PRIMARY KEY,
+  post_id TEXT NOT NULL,
+  author_account_id TEXT NOT NULL,
+  author_username TEXT NOT NULL,
+  content TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('PUBLISHED', 'UNPUBLISHED', 'ADMIN_REMOVED')),
+  admin_note TEXT,
+  content_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_replies_post ON post_replies(post_id, status, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_post_replies_author ON post_replies(author_account_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS relationships (
   account_a TEXT NOT NULL,

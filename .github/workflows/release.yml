@@ -1,0 +1,61 @@
+name: Release
+
+# 每次向默认分支推送提交时自动发版：
+# 最新 Release 标签次版本号 +1（1.0.0 -> 1.1.0 -> 1.2.0；无标签时从 package.json 的 1.0.0 起算为 1.1.0），
+# 版本号写回 package.json 后以 [skip ci] 提交（不会触发循环），
+# 仓库文件打包成 zip，随 Release 一起发布，发布说明取自 RELEASE_NOTES.md。
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # 带有 [skip ci] 的提交（即本 workflow 自己的版本号回写提交）不触发发版
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        run: |
+          LATEST_TAG=$(git tag --sort=-v:refname | head -n 1 || true)
+          if [ -z "$LATEST_TAG" ]; then
+            BASE=$(node -p "require('./package.json').version")
+          else
+            BASE=${LATEST_TAG#v}
+          fi
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          NEXT="${MAJOR}.$((MINOR + 1)).0"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT (base: $BASE)"
+
+      - name: Bump version in package.json
+        run: |
+          npm version "${{ steps.version.outputs.next }}" --no-git-tag-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to ${{ steps.version.outputs.next }} [skip ci]"
+          git push
+
+      - name: Build release zip
+        run: |
+          zip -r "cloudflare-ai-mcp-mail-v${{ steps.version.outputs.next }}.zip" . \
+            -x ".git/*" "node_modules/*" ".wrangler/*" "cloudflare-ai-mcp-mail-*.zip"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ steps.version.outputs.next }}" \
+            --title "v${{ steps.version.outputs.next }}" \
+            --notes-file RELEASE_NOTES.md \
+            "cloudflare-ai-mcp-mail-v${{ steps.version.outputs.next }}.zip"

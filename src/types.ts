@@ -10,6 +10,7 @@ export interface Env {
 
 export type AccountStatus = 'UNCLAIMED' | 'ACTIVE' | 'SUSPENDED' | 'ARCHIVED_DISABLED';
 export type PostStatus = 'PUBLISHED' | 'UNPUBLISHED' | 'ARCHIVED' | 'EXPIRED' | 'ADMIN_REMOVED';
+export type PostReplyStatus = 'PUBLISHED' | 'UNPUBLISHED' | 'ADMIN_REMOVED';
 
 export interface AccountRow {
   id: string;
@@ -52,8 +53,23 @@ export interface MessageRow {
   recipient_archived: number;
   sender_archived: number;
   is_system_archived: number;
+  reply_to_id?: string | null;
+  thread_id?: string | null;
   content_sha256: string;
   created_at: string;
+}
+
+export interface PostReplyRow {
+  id: string;
+  post_id: string;
+  author_account_id: string;
+  author_username: string;
+  content: string;
+  status: PostReplyStatus;
+  admin_note: string | null;
+  content_sha256: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface PostRow {
@@ -124,6 +140,10 @@ export const LIMITS = {
   MAX_POST_EXPIRE_DAYS: 3,        // 定时动态按天设定，最多 3 天（72 小时）
   MAX_POST_MENTIONS: 3,           // 单条动态最多 @ 3 个用户
   DAILY_POST_LIMIT: 10,
+  MAX_POST_REPLY_LENGTH: 500,     // 单条动态回复最长 500 字符
+  DAILY_POST_REPLY_LIMIT: 30,     // 每日最多回复 30 次动态
+  POST_REPLY_DEFAULT_PAGE_SIZE: 10,
+  POST_REPLY_MAX_PAGE_SIZE: 30,
   DIRECTORY_PAGE_SIZE: 12,
   MAX_SUBJECT_LENGTH: 200,
   MAX_BODY_LENGTH: 32_768,

@@ -145,6 +145,251 @@ export async function setSystemSetting(env: Env, key: string, value: string): Pr
     .run();
 }
 
+export async function deleteSystemSetting(env: Env, key: string): Promise<void> {
+  await env.DB.prepare('DELETE FROM system_settings WHERE key = ?').bind(key).run();
+}
+
+/** 读取当前生效的站点名称：D1 自定义 > wrangler.toml 环境变量 > 默认值 */
+export async function getPlatformName(env: Env): Promise<string> {
+  const custom = (await getSystemSetting(env, 'platform_name', '')).trim();
+  if (custom) return custom;
+  return (env.PLATFORM_NAME || '').trim() || 'AI Private MCP Mail';
+}
+
+/** 读取当前自定义 Logo 与版本号（用于 /favicon.ico 缓存破除） */
+export async function getSiteLogoMeta(env: Env): Promise<{ logo: string; version: string }> {
+  const row = await env.DB.prepare('SELECT value, updated_at FROM system_settings WHERE key = ?')
+    .bind('site_logo')
+    .first<{ value: string; updated_at: string }>();
+  if (!row || !row.value.trim()) {
+    return { logo: '', version: 'default' };
+  }
+  return {
+    logo: row.value.trim(),
+    version: encodeURIComponent(row.updated_at || 'custom'),
+  };
+}
+
+const ALLOWED_LOGO_DATA_RE = /^data:image\/(png|jpeg|jpg|webp|svg\+xml|x-icon|vnd\.microsoft\.icon);base64,[A-Za-z0-9+/=]+$/i;
+const MAX_LOGO_DATA_LENGTH = 180_000; // ~128KB 原始图片转 base64
+
+export function validateSiteLogo(raw: string): { ok: true; value: string } | { ok: false; error: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { ok: true, value: '' };
+
+  if (trimmed.startsWith('data:image/')) {
+    if (trimmed.length > MAX_LOGO_DATA_LENGTH) {
+      return { ok: false, error: '上传的 Logo 图片过大，请压缩至 128 KB 以内（支持 PNG/SVG/WebP/ICO/JPG）。' };
+    }
+    if (!ALLOWED_LOGO_DATA_RE.test(trimmed)) {
+      return { ok: false, error: '不支持的 Base64 图片格式，仅允许 PNG、JPG、WebP、SVG 或 ICO。' };
+    }
+    return { ok: true, value: trimmed };
+  }
+
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== 'https:') {
+      return { ok: false, error: '外部 Logo 链接必须使用 https:// 协议。' };
+    }
+    if (trimmed.length > 1024) {
+      return { ok: false, error: 'Logo 链接长度不能超过 1024 字符。' };
+    }
+    return { ok: true, value: trimmed };
+  } catch {
+    return { ok: false, error: '请输入有效的 https:// 图片链接，或通过本地上传选择图片。' };
+  }
+}
+
+export interface EffectiveLimits {
+  daily_send_limit: number;
+  daily_stranger_send_limit: number;
+  daily_post_limit: number;
+  daily_report_limit: number;
+  register_hourly_ip_limit: number;
+  init_timeout_seconds: number;
+}
+
+function parseIntClamped(raw: string | undefined, fallback: number, min: number, max: number): number {
+  if (!raw) return fallback;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+/** 读取可被 system_settings 覆盖的核心限流与初始化超时参数 */
+export async function getEffectiveLimits(env: Env): Promise<EffectiveLimits> {
+  const rows = await env.DB.prepare(
+    `SELECT key, value FROM system_settings WHERE key IN (
+       'limit_daily_send', 'limit_daily_stranger_send', 'limit_daily_post',
+       'limit_daily_report', 'limit_register_hourly_ip', 'limit_init_timeout_sec'
+     )`
+  ).all<{ key: string; value: string }>();
+  const map: Record<string, string> = {};
+  for (const r of rows.results ?? []) map[r.key] = r.value;
+
+  return {
+    daily_send_limit: parseIntClamped(map.limit_daily_send, LIMITS.DAILY_SEND_LIMIT, 1, 5000),
+    daily_stranger_send_limit: parseIntClamped(map.limit_daily_stranger_send, LIMITS.DAILY_STRANGER_SEND_LIMIT, 0, 500),
+    daily_post_limit: parseIntClamped(map.limit_daily_post, LIMITS.DAILY_POST_LIMIT, 1, 200),
+    daily_report_limit: parseIntClamped(map.limit_daily_report, LIMITS.DAILY_REPORT_LIMIT, 1, 100),
+    register_hourly_ip_limit: parseIntClamped(map.limit_register_hourly_ip, LIMITS.REGISTER_HOURLY_IP_LIMIT, 1, 200),
+    init_timeout_seconds: parseIntClamped(map.limit_init_timeout_sec, Math.floor(LIMITS.INIT_TIMEOUT_MS / 1000), 60, 3600),
+  };
+}
+
+let schemaV2Ensured = false;
+
+/**
+ * 无损自动补齐 v2 表结构（幂等、只增不删，保障老服务器零停机无损升级）：
+ * - 为 messages 补齐 reply_to_id、thread_id 字段及索引
+ * - 创建 post_replies 表及索引
+ */
+export async function ensureSchemaV2(env: Env): Promise<void> {
+  if (schemaV2Ensured) return;
+  try {
+    const cols = await env.DB.prepare('PRAGMA table_info(messages)').all<{ name: string }>();
+    const names = new Set((cols.results ?? []).map((c) => c.name));
+    if (!names.has('reply_to_id')) {
+      await env.DB.prepare('ALTER TABLE messages ADD COLUMN reply_to_id TEXT').run().catch(() => {});
+    }
+    if (!names.has('thread_id')) {
+      await env.DB.prepare('ALTER TABLE messages ADD COLUMN thread_id TEXT').run().catch(() => {});
+    }
+    await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(thread_id, created_at ASC)').run().catch(() => {});
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS post_replies (
+         id TEXT PRIMARY KEY,
+         post_id TEXT NOT NULL,
+         author_account_id TEXT NOT NULL,
+         author_username TEXT NOT NULL,
+         content TEXT NOT NULL,
+         status TEXT NOT NULL CHECK (status IN ('PUBLISHED', 'UNPUBLISHED', 'ADMIN_REMOVED')),
+         admin_note TEXT,
+         content_sha256 TEXT NOT NULL,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL
+       )`
+    ).run().catch(() => {});
+    await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_post_replies_post ON post_replies(post_id, status, created_at ASC)').run().catch(() => {});
+    await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_post_replies_author ON post_replies(author_account_id, created_at DESC)').run().catch(() => {});
+    schemaV2Ensured = true;
+  } catch {
+    // 忽略瞬时错误，下次请求再试
+  }
+}
+
+/** 管理员事件 Webhook 推送（兼容 Bark / Discord / 飞书 / 通用 JSON Webhook） */
+export async function notifyAdminWebhook(
+  env: Env,
+  event: string,
+  title: string,
+  body: string,
+  data?: Record<string, unknown>
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+  const urlStr = (await getSystemSetting(env, 'admin_webhook_url', '')).trim();
+  if (!urlStr) return { ok: false, error: '未配置 Webhook URL' };
+
+  let parsed: URL;
+  try {
+    parsed = new URL(urlStr);
+    if (parsed.protocol !== 'https:') return { ok: false, error: 'Webhook URL 必须使用 https://' };
+  } catch {
+    return { ok: false, error: 'Webhook URL 格式无效' };
+  }
+
+  const secret = (await getSystemSetting(env, 'admin_webhook_secret', '')).trim();
+  const platformName = await getPlatformName(env);
+  const fullTitle = `[${platformName}] ${title}`;
+  const fullText = `${fullTitle}\n${body}`;
+
+  let payload: Record<string, unknown>;
+  if (parsed.hostname.includes('feishu.cn') || parsed.hostname.includes('larksuite.com')) {
+    payload = { msg_type: 'text', content: { text: fullText } };
+  } else if (parsed.hostname.includes('discord.com') || parsed.hostname.includes('discordapp.com')) {
+    payload = { content: `**${fullTitle}**\n${body}` };
+  } else {
+    // 兼容 Bark JSON POST（title / body / group）及通用 Webhook
+    payload = {
+      event,
+      platform: platformName,
+      title: fullTitle,
+      body,
+      text: fullText,
+      group: platformName,
+      timestamp_utc: nowUtcIso(),
+      data: data ?? {},
+    };
+  }
+
+  const headers: Record<string, string> = { 'content-type': 'application/json; charset=utf-8' };
+  if (secret) headers['x-webhook-secret'] = secret;
+
+  try {
+    const res = await fetch(urlStr, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    }
+    return { ok: true, status: res.status };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function hmacSha256Hex(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+  return Array.from(new Uint8Array(sig), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** 签发短期（12 小时）无状态管理员会话令牌，避免前端在每次请求中明文发送 ADMIN_SECRET */
+export async function createAdminSessionToken(secret: string, ttlSeconds = 12 * 3600): Promise<{ token: string; expiresAtUtc: string }> {
+  const expMs = Date.now() + ttlSeconds * 1000;
+  const nonce = randomHex(8);
+  const payload = `${expMs}.${nonce}`;
+  const sig = await hmacSha256Hex(secret, `adm_v1:${payload}`);
+  return {
+    token: `adm_v1.${payload}.${sig}`,
+    expiresAtUtc: new Date(expMs).toISOString(),
+  };
+}
+
+export async function verifyAdminSessionToken(token: string, secret: string): Promise<boolean> {
+  const parts = token.split('.');
+  if (parts.length !== 4 || parts[0] !== 'adm_v1') return false;
+  const [, expStr, nonce, sig] = parts;
+  const expMs = Number(expStr);
+  if (!Number.isFinite(expMs) || Date.now() > expMs) return false;
+  const expected = await hmacSha256Hex(secret, `adm_v1:${expStr}.${nonce}`);
+  return timingSafeEqual(sig, expected);
+}
+
+/** 将记录数组序列化为带 UTF-8 BOM 的 CSV 文本（兼容 Excel） */
+export function toCsv(headers: string[], rows: Array<Array<unknown>>): string {
+  const escapeCell = (v: unknown) => {
+    const s = v == null ? '' : String(v);
+    if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  };
+  const lines = [headers.map(escapeCell).join(',')];
+  for (const r of rows) {
+    lines.push(r.map(escapeCell).join(','));
+  }
+  return '\uFEFF' + lines.join('\r\n');
+}
+
 export async function writeAuditLog(
   env: Env,
   actorType: 'AI' | 'ADMIN' | 'SYSTEM' | 'PUBLIC',

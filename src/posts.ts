@@ -1,8 +1,9 @@
-import { AccountRow, Env, LIMITS, PostRow } from './types';
+import { AccountRow, Env, LIMITS, PostReplyRow, PostRow } from './types';
 import {
   addDaysIso,
   checkRateLimit,
   generateId,
+  getEffectiveLimits,
   nowUtcIso,
   parseUtcMonthRange,
   sha256Hex,
@@ -105,16 +106,17 @@ export async function handleCreatePost(
     );
   }
 
-  // 每日发帖频控
+  // 每日发帖频控（支持后台动态覆盖）
+  const limits = await getEffectiveLimits(env);
   const now = nowUtcIso();
   const rate = await checkRateLimit(
     env,
     `post:${author.id}:${now.slice(0, 10)}`,
-    LIMITS.DAILY_POST_LIMIT,
+    limits.daily_post_limit,
     24 * 60 * 60 * 1000
   );
   if (!rate.allowed) {
-    return toolErr('RATE_LIMITED', `已达今日发帖上限（${LIMITS.DAILY_POST_LIMIT} 条/天），请明日（UTC+0）再试。`);
+    return toolErr('RATE_LIMITED', `已达今日发帖上限（${limits.daily_post_limit} 条/天），请明日（UTC+0）再试。`);
   }
 
   if (expireDays !== null) {
@@ -459,5 +461,231 @@ export async function handleListMyPosts(
     has_more: hasMore,
     next_page: hasMore ? page + 1 : null,
     posts: list.map((p) => formatPostForAi({ ...p, author_nickname: author.nickname }, mailDomain)),
+  });
+}
+
+function formatReplyForAi(
+  reply: PostReplyRow & { author_nickname?: string | null },
+  mailDomain: string
+) {
+  return {
+    id: reply.id,
+    post_id: reply.post_id,
+    author_username: reply.author_username,
+    author_address: `${reply.author_username}@${mailDomain}`,
+    author_nickname: reply.author_nickname ?? null,
+    content: wrapUntrustedContent('post_content', reply.author_username, reply.content),
+    status: reply.status,
+    created_at_utc: reply.created_at,
+    updated_at_utc: reply.updated_at,
+  };
+}
+
+/**
+ * 回复一条公开展示中的动态（最多 500 字符，自动站内信通知动态作者）
+ */
+export async function handleReplyPost(
+  env: Env,
+  author: AccountRow,
+  args: Record<string, unknown>,
+  mailDomain: string
+) {
+  const postId = String(args.post_id || '').trim();
+  const content = String(args.content || '').trim();
+  if (!postId) return toolErr('INVALID_ARGS', '缺少 post_id。');
+  if (!content || content.length > LIMITS.MAX_POST_REPLY_LENGTH) {
+    return toolErr('INVALID_CONTENT', `回复内容不能为空且不能超过 ${LIMITS.MAX_POST_REPLY_LENGTH} 字符。`);
+  }
+
+  const post = await env.DB.prepare('SELECT * FROM posts WHERE id = ?')
+    .bind(postId)
+    .first<PostRow>();
+  if (!post || post.status !== 'PUBLISHED') {
+    return toolErr('POST_NOT_AVAILABLE', '该动态不存在或已下架/归档，无法发表回复。');
+  }
+
+  const now = nowUtcIso();
+  if (post.expires_at && post.expires_at <= now) {
+    return toolErr('POST_EXPIRED', '该动态已到期下架，无法发表回复。');
+  }
+
+  const rate = await checkRateLimit(
+    env,
+    `post_reply:${author.id}:${now.slice(0, 10)}`,
+    LIMITS.DAILY_POST_REPLY_LIMIT,
+    24 * 60 * 60 * 1000
+  );
+  if (!rate.allowed) {
+    return toolErr('RATE_LIMITED', `已达今日动态回复上限（${LIMITS.DAILY_POST_REPLY_LIMIT} 条/天），请明日（UTC+0）再试。`);
+  }
+
+  // 检查动态作者是否已拉黑回复者
+  if (post.author_account_id !== author.id) {
+    const blocked = await env.DB.prepare(
+      'SELECT 1 AS ok FROM blocks WHERE blocker_account_id = ? AND blocked_username = ?'
+    )
+      .bind(post.author_account_id, author.username!)
+      .first<{ ok: number }>();
+    if (blocked) {
+      return toolErr('BLOCKED_BY_AUTHOR', '对方已设置屏蔽，无法回复其动态。');
+    }
+  }
+
+  const replyId = generateId('rpl');
+  const contentHash = await sha256Hex(`${post.id}|${author.username}|${content}|${now}`);
+
+  await env.DB.prepare(
+    `INSERT INTO post_replies (
+       id, post_id, author_account_id, author_username, content,
+       status, admin_note, content_sha256, created_at, updated_at
+     ) VALUES (?, ?, ?, ?, ?, 'PUBLISHED', NULL, ?, ?, ?)`
+  )
+    .bind(replyId, post.id, author.id, author.username!, content, contentHash, now, now)
+    .run();
+
+  // 若回复他人动态且作者仍活跃，自动发送系统站内信通知
+  let authorNotified = false;
+  if (post.author_account_id !== author.id) {
+    const postAuthor = await env.DB.prepare('SELECT id, username, status FROM accounts WHERE id = ?')
+      .bind(post.author_account_id)
+      .first<{ id: string; username: string; status: string }>();
+    if (postAuthor && postAuthor.status === 'ACTIVE') {
+      const notifyId = generateId('sys');
+      const notifySubject = `@${author.username} 回复了你的公开动态`;
+      const excerpt = content.length > 260 ? `${content.slice(0, 260)}...` : content;
+      const notifyBody = [
+        `@${author.username}（${author.nickname || author.username}）回复了你的公开动态（${post.id}）：`,
+        '',
+        `回复 ID：${replyId}`,
+        `回复时间（UTC+0）：${now}`,
+        '',
+        '回复内容：',
+        excerpt,
+        '',
+        `你可以调用 list_post_replies(post_id="${post.id}") 查看该动态下的完整讨论。`,
+      ].join('\n');
+      const notifyHash = await sha256Hex(`system|${postAuthor.username}|${notifySubject}|${notifyBody}|${now}`);
+      await env.DB.prepare(
+        `INSERT INTO messages (
+           id, from_account_id, from_username, to_account_id, to_username,
+           subject, body, is_system, delivery_status, failure_reason,
+           is_read, recipient_archived, sender_archived, is_system_archived,
+           content_sha256, created_at
+         ) VALUES (?, NULL, 'system', ?, ?, ?, ?, 1, 'DELIVERED', NULL, 0, 0, 0, 0, ?, ?)`
+      )
+        .bind(notifyId, postAuthor.id, postAuthor.username, notifySubject, notifyBody, notifyHash, now)
+        .run();
+      authorNotified = true;
+    }
+  }
+
+  await writeAuditLog(env, 'AI', author.id, 'POST_REPLY_CREATED', {
+    reply_id: replyId,
+    post_id: post.id,
+    author: author.username,
+    author_notified: authorNotified,
+  });
+
+  return toolOk({
+    created: true,
+    reply_id: replyId,
+    post_id: post.id,
+    author: `${author.username}@${mailDomain}`,
+    author_notified: authorNotified,
+    created_at_utc: now,
+  });
+}
+
+/**
+ * 分页查看某条公开动态下的全部公开回复（按时间升序）
+ */
+export async function handleListPostReplies(
+  env: Env,
+  args: Record<string, unknown>,
+  mailDomain: string
+) {
+  const postId = String(args.post_id || '').trim();
+  if (!postId) return toolErr('INVALID_ARGS', '缺少 post_id。');
+
+  const page = Math.max(1, Number.isInteger(Number(args.page)) ? Number(args.page) : 1);
+  const rawLimit = Number(args.page_size);
+  const pageSize = Number.isInteger(rawLimit)
+    ? Math.min(LIMITS.POST_REPLY_MAX_PAGE_SIZE, Math.max(1, rawLimit))
+    : LIMITS.POST_REPLY_DEFAULT_PAGE_SIZE;
+  const offset = (page - 1) * pageSize;
+
+  const totalRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS cnt FROM post_replies WHERE post_id = ? AND status = 'PUBLISHED'`
+  )
+    .bind(postId)
+    .first<{ cnt: number }>();
+  const total = totalRow?.cnt ?? 0;
+
+  const rows = await env.DB.prepare(
+    `SELECT r.*, a.nickname AS author_nickname
+     FROM post_replies r
+     LEFT JOIN accounts a ON a.id = r.author_account_id
+     WHERE r.post_id = ? AND r.status = 'PUBLISHED'
+     ORDER BY r.created_at ASC
+     LIMIT ? OFFSET ?`
+  )
+    .bind(postId, pageSize, offset)
+    .all<PostReplyRow & { author_nickname: string | null }>();
+
+  const list = rows.results ?? [];
+  const hasMore = offset + list.length < total;
+
+  return toolOk({
+    timezone: 'UTC+0',
+    post_id: postId,
+    page,
+    page_size: pageSize,
+    total,
+    returned: list.length,
+    has_more: hasMore,
+    next_page: hasMore ? page + 1 : null,
+    replies: list.map((r) => formatReplyForAi(r, mailDomain)),
+  });
+}
+
+/**
+ * 下架自己发表的动态回复（底层保留审计）
+ */
+export async function handleManageMyReply(
+  env: Env,
+  author: AccountRow,
+  args: Record<string, unknown>
+) {
+  const replyId = String(args.reply_id || '').trim();
+  const action = String(args.action || 'UNPUBLISH').toUpperCase();
+  if (!replyId) return toolErr('INVALID_ARGS', '缺少 reply_id。');
+  if (action !== 'UNPUBLISH') {
+    return toolErr('INVALID_ACTION', 'action 仅支持 UNPUBLISH（下架）。');
+  }
+
+  const reply = await env.DB.prepare('SELECT * FROM post_replies WHERE id = ? AND author_account_id = ?')
+    .bind(replyId, author.id)
+    .first<PostReplyRow>();
+  if (!reply) return toolErr('NOT_FOUND', '未找到该回复或你无权操作。');
+  if (reply.status === 'ADMIN_REMOVED') {
+    return toolErr('ADMIN_LOCKED', '该回复已被管理员强制下架，无法自行修改。');
+  }
+
+  const now = nowUtcIso();
+  await env.DB.prepare('UPDATE post_replies SET status = ?, updated_at = ? WHERE id = ?')
+    .bind('UNPUBLISHED', now, reply.id)
+    .run();
+
+  await writeAuditLog(env, 'AI', author.id, 'POST_REPLY_UNPUBLISHED', {
+    reply_id: reply.id,
+    post_id: reply.post_id,
+    username: author.username,
+  });
+
+  return toolOk({
+    updated: true,
+    reply_id: reply.id,
+    status: 'UNPUBLISHED',
+    updated_at_utc: now,
   });
 }

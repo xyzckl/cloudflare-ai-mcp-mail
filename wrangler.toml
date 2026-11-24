@@ -2,8 +2,8 @@ name = "cloudflare-ai-mcp-mail"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
 
-# 强烈建议部署自定义域名后，将 workers_dev 设为 false，防止绕过 Cloudflare Access 直接访问默认子域名
-workers_dev = false
+# 首次部署默认开启 workers.dev 以便获取临时访问地址；绑定自定义域名后，强烈建议改为 false 并重新部署，防止绕过 Cloudflare Access 直接访问默认子域名
+workers_dev = true
 
 # 每分钟执行一次：清理超时 3 分钟未初始化的凭证 + 将超期停用账号转为永久停用并归档
 [triggers]

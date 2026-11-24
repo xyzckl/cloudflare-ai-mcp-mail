@@ -5,6 +5,9 @@ import {
   escapeHtml,
   generateCredentialToken,
   generateId,
+  getEffectiveLimits,
+  getPlatformName,
+  getSiteLogoMeta,
   getSystemSetting,
   htmlResponse,
   jsonResponse,
@@ -18,8 +21,14 @@ import {
  * 设计约束：极简大气严肃、零 Emoji、自动同步设备深浅色模式、所有输入框 16px 彻底防止移动端输入自动放大
  */
 export async function renderRegisterPage(env: Env): Promise<Response> {
-  const requireInvite = (await getSystemSetting(env, 'require_invite_code', '1')) === '1';
-  const platformName = escapeHtml(env.PLATFORM_NAME || 'AI Private MCP Mail');
+  const [requireInviteRaw, rawPlatformName, logoMeta] = await Promise.all([
+    getSystemSetting(env, 'require_invite_code', '1'),
+    getPlatformName(env),
+    getSiteLogoMeta(env),
+  ]);
+  const requireInvite = requireInviteRaw === '1';
+  const platformName = escapeHtml(rawPlatformName);
+  const faviconHref = `/favicon.ico?v=${logoMeta.version}`;
   const turnstileSiteKey = env.TURNSTILE_SITE_KEY || '';
 
   const html = `<!doctype html>
@@ -28,8 +37,8 @@ export async function renderRegisterPage(env: Env): Promise<Response> {
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="color-scheme" content="light dark" />
-  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
-  <link rel="shortcut icon" href="/favicon.ico" />
+  <link rel="icon" href="${faviconHref}" />
+  <link rel="shortcut icon" href="${faviconHref}" />
   <title>${platformName} — AI 接入凭证签发</title>
   ${turnstileSiteKey ? '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>' : ''}
   <style>
@@ -371,7 +380,7 @@ export async function renderRegisterPage(env: Env): Promise<Response> {
 <body>
   <header class="topbar">
     <div class="brand">
-      <img src="/favicon.ico" alt="AI Private MCP Mail" width="22" height="22" style="border-radius:5px;display:block;" />
+      <img src="${faviconHref}" alt="${platformName}" width="22" height="22" style="border-radius:5px;display:block;object-fit:cover;" />
       <span>${platformName}</span>
     </div>
     <button type="button" class="theme-btn" id="themeToggle">主题：跟随设备</button>
@@ -557,11 +566,12 @@ export async function renderRegisterPage(env: Env): Promise<Response> {
 export async function handleRegisterApi(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return jsonResponse({ error: 'METHOD_NOT_ALLOWED' }, 405);
 
+  const limits = await getEffectiveLimits(env);
   const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
-  const rate = await checkRateLimit(env, `reg:${clientIp}`, LIMITS.REGISTER_HOURLY_IP_LIMIT, 60 * 60 * 1000);
+  const rate = await checkRateLimit(env, `reg:${clientIp}`, limits.register_hourly_ip_limit, 60 * 60 * 1000);
   if (!rate.allowed) {
     return jsonResponse(
-      { error: 'RATE_LIMITED', message: `当前 IP 申请过于频繁（每小时最多 ${LIMITS.REGISTER_HOURLY_IP_LIMIT} 次），请稍后再试。` },
+      { error: 'RATE_LIMITED', message: `当前 IP 申请过于频繁（每小时最多 ${limits.register_hourly_ip_limit} 次），请稍后再试。` },
       429
     );
   }
@@ -601,7 +611,8 @@ export async function handleRegisterApi(request: Request, env: Env): Promise<Res
   }
 
   const now = nowUtcIso();
-  const expiresAt = addMsIso(now, LIMITS.INIT_TIMEOUT_MS);
+  const initTimeoutMs = limits.init_timeout_seconds * 1000;
+  const expiresAt = addMsIso(now, initTimeoutMs);
   const accountId = generateId('acc');
   const { token, prefix } = generateCredentialToken();
   const tokenHash = await sha256Hex(token);
@@ -630,6 +641,6 @@ export async function handleRegisterApi(request: Request, env: Env): Promise<Res
     mcp_url_bearer: `${origin}/mcp`,
     public_mcp_url: `${origin}/mcp/public`,
     init_expires_at_utc: expiresAt,
-    init_timeout_seconds: LIMITS.INIT_TIMEOUT_MS / 1000,
+    init_timeout_seconds: limits.init_timeout_seconds,
   });
 }

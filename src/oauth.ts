@@ -5,6 +5,9 @@ import {
   escapeHtml,
   generateCredentialToken,
   generateId,
+  getEffectiveLimits,
+  getPlatformName,
+  getSiteLogoMeta,
   getSystemSetting,
   htmlResponse,
   jsonResponse,
@@ -171,8 +174,14 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }
     }
 
-    const requireInvite = (await getSystemSetting(env, 'require_invite_code', '1')) === '1';
-    const platformName = escapeHtml(env.PLATFORM_NAME || 'AI Private MCP Mail');
+    const [requireInviteRaw, rawPlatformName, logoMeta] = await Promise.all([
+      getSystemSetting(env, 'require_invite_code', '1'),
+      getPlatformName(env),
+      getSiteLogoMeta(env),
+    ]);
+    const requireInvite = requireInviteRaw === '1';
+    const platformName = escapeHtml(rawPlatformName);
+    const faviconHref = `/favicon.ico?v=${logoMeta.version}`;
     const clientName = escapeHtml(client?.client_name || clientId);
 
     const html = `<!doctype html>
@@ -181,8 +190,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="color-scheme" content="light dark" />
-  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
-  <link rel="shortcut icon" href="/favicon.ico" />
+  <link rel="icon" href="${faviconHref}" />
+  <link rel="shortcut icon" href="${faviconHref}" />
   <title>${platformName} — 授权接入</title>
   <style>
     :root {
@@ -217,7 +226,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
 <body>
   <main class="card">
     <div class="eyebrow">MCP OAuth 2.1 Authorization</div>
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><img src="/favicon.ico" alt="AI Private MCP Mail" width="24" height="24" style="border-radius:5px;" /><h1 style="margin:0;">授权连接至 ${platformName}</h1></div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;"><img src="${faviconHref}" alt="${platformName}" width="24" height="24" style="border-radius:5px;object-fit:cover;" /><h1 style="margin:0;">授权连接至 ${platformName}</h1></div>
     <p class="lead">请求客户端：<strong>${clientName}</strong></p>
 
     <div class="notice">
@@ -300,7 +309,8 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }
       tokenPlaintext = existingToken;
     } else {
-      const rate = await checkRateLimit(env, `reg:${clientIp}`, LIMITS.REGISTER_HOURLY_IP_LIMIT, 60 * 60 * 1000);
+      const limits = await getEffectiveLimits(env);
+      const rate = await checkRateLimit(env, `reg:${clientIp}`, limits.register_hourly_ip_limit, 60 * 60 * 1000);
       if (!rate.allowed) {
         return htmlResponse('<!doctype html><meta charset="utf-8"><p style="font-family:sans-serif;padding:24px;">当前 IP 注册过于频繁，请稍后再试。</p>', 429);
       }
@@ -314,7 +324,7 @@ export async function handleOAuthAuthorize(request: Request, env: Env): Promise<
       }
 
       const now = nowUtcIso();
-      const expiresAt = addMsIso(now, LIMITS.INIT_TIMEOUT_MS);
+      const expiresAt = addMsIso(now, limits.init_timeout_seconds * 1000);
       const accountId = generateId('acc');
       const { token, prefix } = generateCredentialToken();
       const tokenHash = await sha256Hex(token);

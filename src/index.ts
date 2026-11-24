@@ -11,20 +11,63 @@ import {
   handleProtectedResourceMetadata,
   MCP_CORS_HEADERS,
 } from './oauth';
-import { jsonResponse } from './utils';
+import { ensureSchemaV2, getPlatformName, getSiteLogoMeta, jsonResponse, nowUtcIso } from './utils';
+
+const DEFAULT_FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#2563eb"/><path d="M12 20h40v24H12z" fill="none" stroke="#fff" stroke-width="4"/><path d="M12 22l20 14 20-14" fill="none" stroke="#fff" stroke-width="4"/></svg>`;
+
+function decodeDataUrlImage(dataUrl: string): { mime: string; bytes: Uint8Array } | null {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i.exec(dataUrl);
+  if (!match) return null;
+  try {
+    const bin = atob(match[2]);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return { mime: match[1], bytes };
+  } catch {
+    return null;
+  }
+}
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
     if (path === '/favicon.ico') {
-      // 默认内置一个中性信封图标；部署者可自行替换为自己的 logo 链接
-      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#2563eb"/><path d="M12 20h40v24H12z" fill="none" stroke="#fff" stroke-width="4"/><path d="M12 22l20 14 20-14" fill="none" stroke="#fff" stroke-width="4"/></svg>`;
-      return new Response(svg, {
-        headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' },
+      const { logo } = await getSiteLogoMeta(env);
+      if (logo.startsWith('data:image/')) {
+        const decoded = decodeDataUrlImage(logo);
+        if (decoded) {
+          return new Response(decoded.bytes, {
+            headers: { 'content-type': decoded.mime, 'cache-control': 'public, max-age=300' },
+          });
+        }
+      } else if (logo.startsWith('https://')) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: logo, 'cache-control': 'public, max-age=300' },
+        });
+      }
+      return new Response(DEFAULT_FAVICON_SVG, {
+        headers: { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=300' },
       });
     }
+
+    if (path === '/health') {
+      try {
+        await env.DB.prepare('SELECT 1 AS ok').first();
+        const service = await getPlatformName(env);
+        return jsonResponse({ ok: true, service, time_utc: nowUtcIso() });
+      } catch (err) {
+        return jsonResponse(
+          { ok: false, error: err instanceof Error ? err.message : String(err), time_utc: nowUtcIso() },
+          503
+        );
+      }
+    }
+
+    // 首次请求自动无损补齐 v2 表结构（幂等、只增不删，保障老库零停机升级）
+    await ensureSchemaV2(env);
 
     // 0. MCP OAuth 2.1 标准发现与授权路由（让客户端连接 /mcp 时自动跳转注册/授权）
     if (
@@ -75,12 +118,12 @@ export default {
 
     // 3. 公共 MCP 引导端点（帮助、查状态、提交恢复/删号、查进度、领取新凭证）
     if (path === '/mcp/public') {
-      return handleMcpRequest(request, env, 'public');
+      return handleMcpRequest(request, env, 'public', undefined, ctx);
     }
 
     // 4. 标准 OAuth / Bearer MCP 端点（无凭证时返回 401 + WWW-Authenticate 自动触发 OAuth 注册）
     if (path === '/mcp') {
-      return handleMcpRequest(request, env, 'auth');
+      return handleMcpRequest(request, env, 'auth', undefined, ctx);
     }
 
     // 5. 路径携带凭证的 MCP 端点（兼容仅支持单 URL 的客户端）
@@ -89,12 +132,12 @@ export default {
       if (!token || token.includes('/')) {
         return jsonResponse({ error: 'INVALID_MCP_PATH' }, 400);
       }
-      return handleMcpRequest(request, env, 'auth', token);
+      return handleMcpRequest(request, env, 'auth', token, ctx);
     }
 
     // 6. 管理员后台与 API
     if (path === '/admin') {
-      return renderAdminPage(env);
+      return await renderAdminPage(env);
     }
 
     if (path.startsWith('/api/admin/')) {
