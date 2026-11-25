@@ -2110,7 +2110,7 @@ export async function renderAdminPage(env: Env): Promise<Response> {
       const bytes = new Uint8Array(buf);
       let bin = '';
       for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      return btoa(bin).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
     }
 
     function esc(s) {
@@ -2375,13 +2375,36 @@ export async function renderAdminPage(env: Env): Promise<Response> {
       }
     }
 
+    function suggestPasskeyLabel() {
+      const ua = navigator.userAgent || '';
+      let device = 'Admin';
+      if (ua.indexOf('iPhone') >= 0 || ua.indexOf('iPad') >= 0) device = 'iOS';
+      else if (ua.indexOf('Macintosh') >= 0) device = 'macOS';
+      else if (ua.indexOf('Windows') >= 0) device = 'Windows';
+      else if (ua.indexOf('Android') >= 0) device = 'Android';
+      else if (ua.indexOf('Linux') >= 0) device = 'Linux';
+      const today = new Date().toISOString().slice(0, 10);
+      return device + ' Passkey (' + today + ')';
+    }
+
+    async function submitPasskeyVerify(payload, label) {
+      const finalLabel = String(label || '').trim().slice(0, 64) || suggestPasskeyLabel();
+      await apiFetch('/passkey/register-verify', {
+        method: 'POST',
+        body: JSON.stringify(Object.assign({}, payload, { label: finalLabel }))
+      });
+      document.getElementById('passkeyLabelInput').value = '';
+      showToast('通行密钥「' + finalLabel + '」已成功绑定');
+      loadPasskeys();
+    }
+
     async function registerPasskey() {
       if (!window.PublicKeyCredential) {
         showToast('当前浏览器不支持通行密钥（WebAuthn）');
         return;
       }
       try {
-        const label = document.getElementById('passkeyLabelInput').value.trim() || 'Admin Passkey';
+        const presetLabel = document.getElementById('passkeyLabelInput').value.trim();
         const data = await apiFetch('/passkey/register-options', { method: 'POST', body: '{}' });
         const o = data.options;
         const pubKey = {
@@ -2407,25 +2430,46 @@ export async function renderAdminPage(env: Env): Promise<Response> {
           throw new Error('当前浏览器版本过旧，缺少 WebAuthn Level 2 getPublicKey 接口，请升级浏览器。');
         }
         const spki = resp.getPublicKey();
+        if (!spki) {
+          throw new Error('未能从认证器读取公钥（SPKI），请更换支持 ES256/RS256 的设备或浏览器重试。');
+        }
         const authData = resp.getAuthenticatorData();
         const alg = resp.getPublicKeyAlgorithm();
         const transports = typeof resp.getTransports === 'function' ? resp.getTransports() : [];
 
-        await apiFetch('/passkey/register-verify', {
-          method: 'POST',
-          body: JSON.stringify({
-            label: label,
-            credential_id: b64uEncode(cred.rawId),
-            client_data_json: b64uEncode(resp.clientDataJSON),
-            authenticator_data: b64uEncode(authData),
-            public_key_spki: b64uEncode(spki),
-            algorithm: alg,
-            transports: transports
-          })
-        });
-        document.getElementById('passkeyLabelInput').value = '';
-        showToast('通行密钥已成功绑定');
-        loadPasskeys();
+        const payload = {
+          credential_id: b64uEncode(cred.rawId),
+          client_data_json: b64uEncode(resp.clientDataJSON),
+          authenticator_data: b64uEncode(authData),
+          public_key_spki: b64uEncode(spki),
+          algorithm: alg,
+          transports: transports
+        };
+
+        if (presetLabel) {
+          await submitPasskeyVerify(payload, presetLabel);
+          return;
+        }
+
+        const defaultName = suggestPasskeyLabel();
+        openModal('为新通行密钥命名',
+          '<div class="muted" style="margin-bottom:8px;">通行密钥已创建，请填写设备备注名称（或直接使用默认名称）：</div>' +
+          '<input id="mPasskeyLabel" type="text" maxlength="64" value="' + esc(defaultName) + '" placeholder="' + esc(defaultName) + '" autocomplete="off" />',
+          [
+            { label: '取消', onClick: closeModal },
+            {
+              label: '确认保存',
+              cls: 'btn-primary',
+              onClick: async function () {
+                try {
+                  const chosen = document.getElementById('mPasskeyLabel').value.trim() || defaultName;
+                  closeModal();
+                  await submitPasskeyVerify(payload, chosen);
+                } catch (e) { showToast(e.message || String(e)); }
+              }
+            }
+          ]
+        );
       } catch (e) {
         showToast(e.message || String(e));
       }
