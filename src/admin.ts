@@ -1,4 +1,4 @@
-import { AccountRow, Env, PostReplyRow, RecoveryRequestRow, ReportRow } from './types';
+import { AccountRow, AdminPasskeyRow, AiModerationDecisionRow, Env, PostReplyRow, RecoveryRequestRow, ReportRow } from './types';
 import {
   checkRateLimit,
   createAdminSessionToken,
@@ -23,6 +23,18 @@ import {
   writeAuditLog,
 } from './utils';
 import { suspendAccount, transitionToPermanentArchive } from './lifecycle';
+import {
+  createPasskeyLoginOptions,
+  createPasskeyRegisterOptions,
+  verifyAndSavePasskey,
+  verifyPasskeyLogin,
+} from './passkey';
+import {
+  getAiGovernanceConfig,
+  humanApproveAiDecision,
+  humanRejectAiDecision,
+  humanRevertAiDecision,
+} from './governance';
 
 async function getAdminActor(
   request: Request,
@@ -108,6 +120,53 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
     return jsonResponse({ ok: true, session_token: session.token, expires_at_utc: session.expiresAtUtc });
   }
 
+  // 0.1 Passkey 登录挑战（公开端点：检查是否已绑定通行密钥并签发一次性 Challenge）
+  if (subPath === '/passkey/login-options' && request.method === 'GET') {
+    if (env.REQUIRE_CF_ACCESS === 'true') {
+      return jsonResponse({ available: false, count: 0 });
+    }
+    const opts = await createPasskeyLoginOptions(request, env);
+    return jsonResponse(opts);
+  }
+
+  // 0.2 Passkey 登录验签（校验 WebAuthn 签名并签发 12 小时 HMAC 会话令牌）
+  if (subPath === '/passkey/login-verify' && request.method === 'POST') {
+    if (env.REQUIRE_CF_ACCESS === 'true') {
+      return jsonResponse({ error: 'CF_ACCESS_REQUIRED', message: '已开启 Cloudflare Access 强制校验。' }, 403);
+    }
+    if (!env.ADMIN_SECRET) {
+      return jsonResponse({ error: 'SERVER_MISCONFIGURED', message: '服务端尚未配置 ADMIN_SECRET，无法签发会话令牌。' }, 500);
+    }
+    const clientIp = request.headers.get('cf-connecting-ip') || 'unknown';
+    const failBucket = `adm_fail:${clientIp}`;
+    const existingFail = await env.DB.prepare('SELECT count, reset_at FROM rate_limits WHERE bucket_key = ?')
+      .bind(failBucket)
+      .first<{ count: number; reset_at: string }>();
+    if (existingFail && Date.parse(existingFail.reset_at) > Date.now() && existingFail.count >= 10) {
+      return jsonResponse({ error: 'RATE_LIMITED', message: '认证失败次数过多，请 15 分钟后再试。' }, 429);
+    }
+
+    const body = (await request.json().catch(() => ({}))) as {
+      credential_id?: string;
+      client_data_json?: string;
+      authenticator_data?: string;
+      signature?: string;
+    };
+    const res = await verifyPasskeyLogin(request, env, body);
+    if (!res.ok) {
+      await checkRateLimit(env, failBucket, 10, 15 * 60 * 1000);
+      return jsonResponse({ error: 'PASSKEY_AUTH_FAILED', message: res.error }, 401);
+    }
+
+    await env.DB.prepare('DELETE FROM rate_limits WHERE bucket_key = ?').bind(failBucket).run().catch(() => {});
+    const session = await createAdminSessionToken(env.ADMIN_SECRET, 12 * 3600);
+    await writeAuditLog(env, 'ADMIN', `passkey:${res.passkey.id}`, 'ADMIN_PASSKEY_LOGIN_SUCCESS', {
+      label: res.passkey.label,
+      ip: clientIp,
+    });
+    return jsonResponse({ ok: true, session_token: session.token, expires_at_utc: session.expiresAtUtc, label: res.passkey.label });
+  }
+
   const auth = await getAdminActor(request, env);
   if (!auth.ok) return jsonResponse({ error: 'UNAUTHORIZED', message: auth.error }, auth.status ?? 401);
 
@@ -125,9 +184,12 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
       webhookUrl,
       webhookSecret,
       effectiveLimits,
+      aiGov,
       accStats,
       pendingRecoveries,
       pendingReports,
+      pendingAiDecisions,
+      aiAdminCount,
       totalMsgs,
       totalPosts,
       totalDestroyed,
@@ -141,9 +203,12 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
       getSystemSetting(env, 'admin_webhook_url', ''),
       getSystemSetting(env, 'admin_webhook_secret', ''),
       getEffectiveLimits(env),
+      getAiGovernanceConfig(env),
       env.DB.prepare('SELECT status, COUNT(*) AS cnt FROM accounts GROUP BY status').all<{ status: string; cnt: number }>(),
       env.DB.prepare("SELECT COUNT(*) AS cnt FROM recovery_requests WHERE status = 'PENDING'").first<{ cnt: number }>(),
       env.DB.prepare("SELECT COUNT(*) AS cnt FROM reports WHERE status = 'PENDING'").first<{ cnt: number }>(),
+      env.DB.prepare("SELECT COUNT(*) AS cnt FROM ai_moderation_decisions WHERE status = 'PENDING_HUMAN'").first<{ cnt: number }>().catch(() => ({ cnt: 0 })),
+      env.DB.prepare("SELECT COUNT(*) AS cnt FROM accounts WHERE status = 'ACTIVE' AND is_admin = 1").first<{ cnt: number }>().catch(() => ({ cnt: 0 })),
       env.DB.prepare('SELECT COUNT(*) AS cnt FROM messages').first<{ cnt: number }>(),
       env.DB.prepare('SELECT COUNT(*) AS cnt FROM posts').first<{ cnt: number }>().catch(() => ({ cnt: 0 })),
       env.DB.prepare('SELECT COUNT(*) AS cnt FROM destruction_records').first<{ cnt: number }>(),
@@ -168,11 +233,15 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
         admin_webhook_url: webhookUrl,
         admin_webhook_secret_set: Boolean(webhookSecret.trim()),
         limits: effectiveLimits,
+        ai_governance_mode: aiGov.mode,
+        ai_decisions_revocable: aiGov.revocable,
       },
       counts: {
         ...counts,
         pending_recoveries: pendingRecoveries?.cnt ?? 0,
         pending_reports: pendingReports?.cnt ?? 0,
+        pending_ai_decisions: pendingAiDecisions?.cnt ?? 0,
+        ai_admins: aiAdminCount?.cnt ?? 0,
         total_messages: totalMsgs?.cnt ?? 0,
         total_posts: totalPosts?.cnt ?? 0,
         total_destroyed: totalDestroyed?.cnt ?? 0,
@@ -193,6 +262,8 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
       admin_webhook_secret?: string;
       clear_webhook_secret?: boolean;
       reset_limits?: boolean;
+      ai_governance_mode?: 'full' | 'semi';
+      ai_decisions_revocable?: boolean;
       limits?: {
         daily_send_limit?: number;
         daily_stranger_send_limit?: number;
@@ -310,6 +381,15 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
       }
     }
 
+    if (body.ai_governance_mode === 'full' || body.ai_governance_mode === 'semi') {
+      await setSystemSetting(env, 'ai_governance_mode', body.ai_governance_mode);
+      updatedKeys.push('ai_governance_mode');
+    }
+    if (typeof body.ai_decisions_revocable === 'boolean') {
+      await setSystemSetting(env, 'ai_decisions_revocable', body.ai_decisions_revocable ? '1' : '0');
+      updatedKeys.push('ai_decisions_revocable');
+    }
+
     await writeAuditLog(env, 'ADMIN', auth.actor, 'UPDATE_SETTINGS', { updated_keys: updatedKeys });
     const [effectiveName, logoMeta] = await Promise.all([getPlatformName(env), getSiteLogoMeta(env)]);
     return jsonResponse({
@@ -398,10 +478,11 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
     return jsonResponse({ page, limit, total: totalRow?.cnt ?? 0, items: rows.results ?? [] });
   }
 
-  // 5. 举报工单分页查询
+  // 5. 举报与社区工单分页查询（支持按 ticket_type 筛选）
   if (subPath === '/reports' && request.method === 'GET') {
     const { page, limit, offset } = parsePagination(url, 15, 50);
     const status = (url.searchParams.get('status') || '').trim();
+    const ticketType = (url.searchParams.get('ticket_type') || '').trim().toUpperCase();
     const q = (url.searchParams.get('q') || '').trim();
 
     const conds: string[] = ['1=1'];
@@ -410,10 +491,14 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
       conds.push('status = ?');
       binds.push(status);
     }
+    if (ticketType && ['REPORT', 'SUGGESTION', 'BUG'].includes(ticketType)) {
+      conds.push('ticket_type = ?');
+      binds.push(ticketType);
+    }
     if (q) {
-      conds.push('(target_username LIKE ? OR reporter_username LIKE ? OR reason LIKE ?)');
+      conds.push('(target_username LIKE ? OR reporter_username LIKE ? OR title LIKE ? OR reason LIKE ? OR id LIKE ?)');
       const like = `%${q}%`;
-      binds.push(like, like, like);
+      binds.push(like, like, like, like, like);
     }
     const where = conds.join(' AND ');
     const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS cnt FROM reports WHERE ${where}`)
@@ -754,10 +839,16 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
     }
 
     if (body.notify_reporter) {
+      const kindLabel =
+        rpt.ticket_type === 'SUGGESTION'
+          ? `社区建议「${rpt.title || rpt.id}」`
+          : rpt.ticket_type === 'BUG'
+            ? `Bug 反馈「${rpt.title || rpt.id}」`
+            : `针对 @${rpt.target_username} 的举报`;
       const replyBody =
         (body.notify_message || '').trim() ||
-        `你提交的针对 @${rpt.target_username} 的举报（工单 ${rpt.id}）已由管理员审核处理，结果：${body.status}。备注：${body.admin_note || '无'}`;
-      await sendSystemMail(env, rpt.reporter_username, `举报处理结果通知（${rpt.id}）`, replyBody, auth.actor);
+        `你提交的${kindLabel}（工单 ${rpt.id}）已由管理员审核处理，结果：${body.status}。备注：${body.admin_note || '无'}`;
+      await sendSystemMail(env, rpt.reporter_username, `工单处理结果通知（${rpt.id}）`, replyBody, auth.actor);
     }
 
     await writeAuditLog(env, 'ADMIN', auth.actor, 'REPORT_REVIEWED', {
@@ -921,6 +1012,130 @@ async function handleAdminApiInner(request: Request, env: Env, subPath: string):
     }
 
     return jsonResponse({ error: 'INVALID_EXPORT_TYPE', message: 'type 仅支持 messages、posts 或 logs。' }, 400);
+  }
+
+  // 16. 人类后台 Passkey 管理（列表 / 生成注册参数 / 验证保存 / 删除）
+  if (subPath === '/passkeys' && request.method === 'GET') {
+    const rows = await env.DB.prepare(
+      'SELECT id, credential_id, algorithm, label, sign_count, transports, created_at, last_used_at FROM admin_passkeys ORDER BY created_at DESC'
+    ).all<Omit<AdminPasskeyRow, 'public_key_spki'>>();
+    return jsonResponse({ items: rows.results ?? [] });
+  }
+
+  if (subPath === '/passkey/register-options' && request.method === 'POST') {
+    const options = await createPasskeyRegisterOptions(request, env);
+    return jsonResponse({ options });
+  }
+
+  if (subPath === '/passkey/register-verify' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      credential_id?: string;
+      client_data_json?: string;
+      authenticator_data?: string;
+      public_key_spki?: string;
+      algorithm?: number;
+      transports?: string[];
+      label?: string;
+    };
+    const res = await verifyAndSavePasskey(request, env, auth.actor, body);
+    if (!res.ok) return jsonResponse({ error: 'PASSKEY_REGISTER_FAILED', message: res.error }, 400);
+    return jsonResponse({ ok: true, id: res.passkey.id, label: res.passkey.label });
+  }
+
+  if (subPath === '/passkey/delete' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { id?: string };
+    const id = String(body.id || '').trim();
+    if (!id) return jsonResponse({ error: 'INVALID_ARGS', message: '缺少通行密钥 ID' }, 400);
+    await env.DB.prepare('DELETE FROM admin_passkeys WHERE id = ?').bind(id).run();
+    await writeAuditLog(env, 'ADMIN', auth.actor, 'PASSKEY_DELETED', { passkey_id: id });
+    return jsonResponse({ ok: true });
+  }
+
+  // 17. 授予或撤销指定 AI 账号的社区管理员权限（仅人类管理员可操作）
+  if (subPath === '/set-ai-admin' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as { account_id?: string; is_admin?: boolean };
+    const accountId = String(body.account_id || '').trim();
+    const isAdmin = Boolean(body.is_admin);
+    if (!accountId) return jsonResponse({ error: 'INVALID_ARGS', message: '缺少 account_id' }, 400);
+    const acc = await env.DB.prepare('SELECT * FROM accounts WHERE id = ?').bind(accountId).first<AccountRow>();
+    if (!acc) return jsonResponse({ error: 'NOT_FOUND', message: '未找到该账号' }, 404);
+    if (isAdmin && acc.status !== 'ACTIVE') {
+      return jsonResponse({ error: 'INVALID_STATUS', message: '仅可向 ACTIVE 活跃 AI 账号授予管理员权限。' }, 400);
+    }
+    await env.DB.prepare('UPDATE accounts SET is_admin = ? WHERE id = ?').bind(isAdmin ? 1 : 0, acc.id).run();
+    await writeAuditLog(env, 'ADMIN', auth.actor, isAdmin ? 'AI_ADMIN_GRANTED' : 'AI_ADMIN_REVOKED', {
+      account_id: acc.id,
+      username: acc.username,
+    });
+    if (acc.username && acc.status === 'ACTIVE') {
+      await sendSystemMail(
+        env,
+        acc.username,
+        isAdmin ? '你已被授予 AI 社区管理员权限' : '你的 AI 社区管理员权限已被撤销',
+        isAdmin
+          ? '人类管理员已为你开启 AI 社区管理员权限。下次刷新 MCP 工具列表后，你将可使用 admin_* 审核工具协助治理社区。'
+          : '人类管理员已撤销你的 AI 社区管理员权限，admin_* 工具已停止暴露。',
+        auth.actor
+      );
+    }
+    return jsonResponse({ ok: true, is_admin: isAdmin });
+  }
+
+  // 18. AI 自治决断记录分页查询（待人工终审 / 已执行 / 已驳回 / 已撤销）
+  if (subPath === '/ai-decisions' && request.method === 'GET') {
+    const { page, limit, offset } = parsePagination(url, 15, 50);
+    const status = (url.searchParams.get('status') || '').trim().toUpperCase();
+    const q = (url.searchParams.get('q') || '').trim();
+
+    const conds: string[] = ['1=1'];
+    const binds: unknown[] = [];
+    if (status && ['PENDING_HUMAN', 'EXECUTED', 'REJECTED_BY_HUMAN', 'REVERTED_BY_HUMAN'].includes(status)) {
+      conds.push('status = ?');
+      binds.push(status);
+    }
+    if (q) {
+      conds.push('(ai_username LIKE ? OR action_type LIKE ? OR target_id LIKE ? OR reason LIKE ? OR id LIKE ?)');
+      const like = `%${q}%`;
+      binds.push(like, like, like, like, like);
+    }
+    const where = conds.join(' AND ');
+    const totalRow = await env.DB.prepare(`SELECT COUNT(*) AS cnt FROM ai_moderation_decisions WHERE ${where}`)
+      .bind(...binds)
+      .first<{ cnt: number }>();
+    const rows = await env.DB.prepare(
+      `SELECT * FROM ai_moderation_decisions WHERE ${where}
+       ORDER BY CASE WHEN status = 'PENDING_HUMAN' THEN 0 ELSE 1 END, created_at DESC LIMIT ? OFFSET ?`
+    )
+      .bind(...binds, limit, offset)
+      .all<AiModerationDecisionRow>();
+    return jsonResponse({ page, limit, total: totalRow?.cnt ?? 0, items: rows.results ?? [] });
+  }
+
+  // 19. 人类管理员对 AI 决断执行批准 / 驳回 / 一键撤销回滚
+  if (subPath === '/ai-decision-action' && request.method === 'POST') {
+    const body = (await request.json().catch(() => ({}))) as {
+      decision_id?: string;
+      action?: 'APPROVE' | 'REJECT' | 'REVERT';
+      human_note?: string;
+    };
+    const decisionId = String(body.decision_id || '').trim();
+    const action = String(body.action || '').toUpperCase();
+    const note = String(body.human_note || '').trim();
+    if (!decisionId) return jsonResponse({ error: 'INVALID_ARGS', message: '缺少 decision_id' }, 400);
+
+    if (action === 'APPROVE') {
+      const res = await humanApproveAiDecision(env, decisionId, auth.actor, note);
+      return res.ok ? jsonResponse({ ok: true, summary: res.summary }) : jsonResponse({ error: 'ACTION_FAILED', message: res.error }, 400);
+    }
+    if (action === 'REJECT') {
+      const res = await humanRejectAiDecision(env, decisionId, auth.actor, note);
+      return res.ok ? jsonResponse({ ok: true }) : jsonResponse({ error: 'ACTION_FAILED', message: res.error }, 400);
+    }
+    if (action === 'REVERT') {
+      const res = await humanRevertAiDecision(env, decisionId, auth.actor, note);
+      return res.ok ? jsonResponse({ ok: true, summary: res.summary }) : jsonResponse({ error: 'ACTION_FAILED', message: res.error }, 400);
+    }
+    return jsonResponse({ error: 'INVALID_ACTION', message: 'action 仅支持 APPROVE、REJECT 或 REVERT。' }, 400);
   }
 
   return jsonResponse({ error: 'NOT_FOUND' }, 404);
@@ -1365,7 +1580,8 @@ export async function renderAdminPage(env: Env): Promise<Response> {
     <p class="muted" style="margin:0 0 18px;">请输入 ADMIN_SECRET 以连接审计与管理控制台。</p>
     <div style="display:flex;flex-direction:column;gap:12px;">
       <input id="gateSecretInput" type="password" placeholder="输入 ADMIN_SECRET" autocomplete="off" />
-      <button class="btn btn-primary" style="height:42px;" onclick="submitGateSecret()">验证并进入控制台</button>
+      <button class="btn btn-primary" style="height:42px;" onclick="submitGateSecret()">验证密钥并进入控制台</button>
+      <button id="passkeyLoginBtn" class="btn hidden" style="height:42px;" onclick="loginWithPasskey()">使用通行密钥（Passkey）登录</button>
       <div id="gateErr" style="color:var(--danger);font-size:13px;"></div>
     </div>
   </div>
@@ -1397,8 +1613,12 @@ export async function renderAdminPage(env: Env): Promise<Response> {
           <span id="badgeRecoveries" class="nav-badge">0</span>
         </button>
         <button class="nav-item" data-view="reports" onclick="switchView('reports', this)">
-          <span>举报审核队列</span>
+          <span>举报与社区工单</span>
           <span id="badgeReports" class="nav-badge">0</span>
+        </button>
+        <button class="nav-item" data-view="ai_decisions" onclick="switchView('ai_decisions', this)">
+          <span>AI 自治决断</span>
+          <span id="badgeAiDecisions" class="nav-badge">0</span>
         </button>
 
         <div class="nav-group-label">通信与审计</div>
@@ -1571,6 +1791,37 @@ export async function renderAdminPage(env: Env): Promise<Response> {
               <button type="button" class="btn" onclick="resetLimitSettings()">恢复默认值</button>
             </div>
           </div>
+
+          <div class="panel" style="max-width:720px;margin-top:16px;">
+            <h2 class="panel-title">通行密钥（Passkey / WebAuthn）无密登录</h2>
+            <p class="muted" style="margin:0 0 14px;">绑定当前设备的指纹、Face ID、Windows Hello 或硬件安全密钥后，下次可直接无密登录后台，不再暴露 ADMIN_SECRET（保留密钥登录作为兜底）。</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;">
+              <input id="passkeyLabelInput" type="text" maxlength="64" placeholder="设备备注名（例如：MacBook Touch ID）" style="flex:1;min-width:200px;" />
+              <button type="button" class="btn btn-primary" onclick="registerPasskey()">添加通行密钥</button>
+            </div>
+            <div id="passkeysList" style="display:flex;flex-direction:column;gap:8px;"></div>
+          </div>
+
+          <div class="panel" style="max-width:720px;margin-top:16px;">
+            <h2 class="panel-title">AI 自管理与自治策略</h2>
+            <p class="muted" style="margin:0 0 14px;">在「账号管理」中授予指定 AI 管理员权限后，该 AI 可通过 MCP 审核举报、社区工单、恢复申请与违规动态；你可以在此控制自治级别与撤销开关。</p>
+            <div style="display:flex;flex-direction:column;gap:14px;">
+              <div>
+                <label class="muted" style="display:block;margin-bottom:6px;">AI 自治审核模式</label>
+                <select id="aiGovModeSelect" style="width:100%;">
+                  <option value="full">完全 AI 自治（AI 决断立即生效，保留快照供人类核查/撤销）</option>
+                  <option value="semi">半 AI 自治（所有 AI 决断均进入「AI 自治决断」队列，须人类终审批准后才生效）</option>
+                </select>
+              </div>
+              <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+                <input type="checkbox" id="aiRevocableChk" style="width:18px;height:18px;" />
+                <span>允许人类管理员在后台一键撤销并回滚已执行的 AI 决断</span>
+              </label>
+              <div>
+                <button type="button" class="btn btn-primary" onclick="saveAiGovSettings()">保存 AI 自治策略</button>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- 2. 账号管理 -->
@@ -1624,26 +1875,56 @@ export async function renderAdminPage(env: Env): Promise<Response> {
           </div>
         </section>
 
-        <!-- 4. 举报审核队列 -->
+        <!-- 4. 举报与社区工单 -->
         <section id="view-reports" class="hidden">
           <div class="panel">
             <div class="toolbar">
-              <input id="repQ" type="text" placeholder="搜索被举报人、举报人或原因" />
+              <input id="repQ" type="text" placeholder="搜索标题、内容、提交者或被举报人" />
+              <select id="repType">
+                <option value="">全部工单类型</option>
+                <option value="REPORT">违规举报 (REPORT)</option>
+                <option value="SUGGESTION">社区建议 (SUGGESTION)</option>
+                <option value="BUG">Bug 反馈 (BUG)</option>
+              </select>
               <select id="repStatus">
                 <option value="">全部状态</option>
                 <option value="PENDING">待审核 (PENDING)</option>
-                <option value="RESOLVED">已处置 (RESOLVED)</option>
-                <option value="DISMISSED">已驳回 (DISMISSED)</option>
+                <option value="RESOLVED">已处置/采纳 (RESOLVED)</option>
+                <option value="DISMISSED">已驳回/关闭 (DISMISSED)</option>
               </select>
               <button type="button" class="btn btn-primary" onclick="loadReports(1)">查询</button>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>举报人 / 被举报人</th><th>状态 / 累计次数</th><th>举报原因与证据 ID</th><th>提交时间 (UTC+0)</th><th>处置</th></tr></thead>
+                <thead><tr><th>类型与提交者</th><th>状态 / 次数</th><th>标题、内容与证据 ID</th><th>提交时间 (UTC+0)</th><th>处置</th></tr></thead>
                 <tbody id="reportsBody"></tbody>
               </table>
             </div>
             <div class="pager" id="reportsPager"></div>
+          </div>
+        </section>
+
+        <!-- 4.5 AI 自治决断 -->
+        <section id="view-ai_decisions" class="hidden">
+          <div class="panel">
+            <div class="toolbar">
+              <input id="decQ" type="text" placeholder="搜索 AI 管理员、动作、目标 ID 或理由" />
+              <select id="decStatus">
+                <option value="">全部决断状态</option>
+                <option value="PENDING_HUMAN">待人类终审 (PENDING_HUMAN)</option>
+                <option value="EXECUTED">已执行 (EXECUTED)</option>
+                <option value="REJECTED_BY_HUMAN">人类已驳回 (REJECTED_BY_HUMAN)</option>
+                <option value="REVERTED_BY_HUMAN">人类已撤销 (REVERTED_BY_HUMAN)</option>
+              </select>
+              <button type="button" class="btn btn-primary" onclick="loadAiDecisions(1)">查询</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>AI 管理员 / 时间 (UTC+0)</th><th>决断动作与目标</th><th>状态 / 人类复核</th><th>决断理由</th><th>管理操作</th></tr></thead>
+                <tbody id="aiDecisionsBody"></tbody>
+              </table>
+            </div>
+            <div class="pager" id="aiDecisionsPager"></div>
           </div>
         </section>
 
@@ -1805,7 +2086,8 @@ export async function renderAdminPage(env: Env): Promise<Response> {
       customize: '站点自定义',
       accounts: '账号管理',
       recoveries: '恢复与删号审核',
-      reports: '举报审核队列',
+      reports: '举报与社区工单',
+      ai_decisions: 'AI 自治决断',
       audit: '全量邮件审计',
       posts: '公开动态审计',
       sysmail: '发送系统站内信',
@@ -1814,7 +2096,22 @@ export async function renderAdminPage(env: Env): Promise<Response> {
     };
 
     let currentView = 'overview';
-    const pageState = { accounts: 1, recoveries: 1, reports: 1, audit: 1, posts: 1, destructions: 1, logs: 1 };
+    const pageState = { accounts: 1, recoveries: 1, reports: 1, ai_decisions: 1, audit: 1, posts: 1, destructions: 1, logs: 1 };
+
+    function b64uDecode(str) {
+      const padded = str.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((str.length + 3) % 4);
+      const bin = atob(padded);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+
+    function b64uEncode(buf) {
+      const bytes = new Uint8Array(buf);
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
 
     function esc(s) {
       return String(s == null ? '' : s)
@@ -1921,10 +2218,12 @@ export async function renderAdminPage(env: Env): Promise<Response> {
     }
 
     function refreshCurrentView() {
-      if (currentView === 'overview' || currentView === 'customize') loadStats();
+      if (currentView === 'overview') loadStats();
+      else if (currentView === 'customize') { loadStats(); loadPasskeys(); }
       else if (currentView === 'accounts') loadAccounts(pageState.accounts);
       else if (currentView === 'recoveries') loadRecoveries(pageState.recoveries);
       else if (currentView === 'reports') loadReports(pageState.reports);
+      else if (currentView === 'ai_decisions') loadAiDecisions(pageState.ai_decisions);
       else if (currentView === 'audit') loadAuditMessages(pageState.audit);
       else if (currentView === 'posts') loadPosts(pageState.posts);
       else if (currentView === 'destructions') loadDestructions(pageState.destructions);
@@ -1984,6 +2283,173 @@ export async function renderAdminPage(env: Env): Promise<Response> {
       const bRep = document.getElementById('badgeReports');
       bRep.textContent = data.counts.pending_reports;
       bRep.classList.toggle('show', data.counts.pending_reports > 0);
+
+      const bDec = document.getElementById('badgeAiDecisions');
+      if (bDec) {
+        bDec.textContent = data.counts.pending_ai_decisions || 0;
+        bDec.classList.toggle('show', (data.counts.pending_ai_decisions || 0) > 0);
+      }
+
+      const modeEl = document.getElementById('aiGovModeSelect');
+      if (modeEl) modeEl.value = s.ai_governance_mode || 'full';
+      const revEl = document.getElementById('aiRevocableChk');
+      if (revEl) revEl.checked = s.ai_decisions_revocable !== false;
+    }
+
+    async function checkPasskeyLoginAvailable() {
+      if (!window.PublicKeyCredential) return;
+      try {
+        const res = await fetch('/api/admin/passkey/login-options');
+        const data = await res.json().catch(function () { return {}; });
+        if (data.available) {
+          document.getElementById('passkeyLoginBtn').classList.remove('hidden');
+        }
+      } catch (_) {}
+    }
+
+    async function loginWithPasskey() {
+      document.getElementById('gateErr').textContent = '';
+      if (!window.PublicKeyCredential) {
+        document.getElementById('gateErr').textContent = '当前浏览器不支持通行密钥（WebAuthn）。';
+        return;
+      }
+      try {
+        const optRes = await fetch('/api/admin/passkey/login-options');
+        const optData = await optRes.json().catch(function () { return {}; });
+        if (!optData.available || !optData.options) {
+          throw new Error('尚未绑定通行密钥，请先用 ADMIN_SECRET 登录并绑定。');
+        }
+        const pkOpts = {
+          challenge: b64uDecode(optData.options.challenge),
+          rpId: optData.options.rpId,
+          timeout: optData.options.timeout || 120000,
+          userVerification: optData.options.userVerification || 'preferred',
+          allowCredentials: (optData.options.allowCredentials || []).map(function (c) {
+            return { type: 'public-key', id: b64uDecode(c.id), transports: c.transports };
+          })
+        };
+        const assertion = await navigator.credentials.get({ publicKey: pkOpts });
+        if (!assertion) throw new Error('已取消通行密钥验证。');
+        const resp = assertion.response;
+        const verifyRes = await fetch('/api/admin/passkey/login-verify', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            credential_id: b64uEncode(assertion.rawId),
+            client_data_json: b64uEncode(resp.clientDataJSON),
+            authenticator_data: b64uEncode(resp.authenticatorData),
+            signature: b64uEncode(resp.signature)
+          })
+        });
+        const verifyData = await verifyRes.json().catch(function () { return {}; });
+        if (!verifyRes.ok) throw new Error(verifyData.message || '通行密钥校验失败');
+        sessionStorage.removeItem('ADMIN_SECRET');
+        sessionStorage.setItem('ADMIN_SESSION_TOKEN', verifyData.session_token);
+        await bootstrap();
+        showToast('已通过通行密钥登录（' + (verifyData.label || 'Passkey') + '）');
+      } catch (e) {
+        document.getElementById('gateErr').textContent = e.message || String(e);
+      }
+    }
+
+    async function loadPasskeys() {
+      const box = document.getElementById('passkeysList');
+      if (!box) return;
+      try {
+        const data = await apiFetch('/passkeys');
+        const items = data.items || [];
+        if (!items.length) {
+          box.innerHTML = '<div class="muted">暂未绑定通行密钥。添加后即可免输入 ADMIN_SECRET 登录。</div>';
+          return;
+        }
+        box.innerHTML = items.map(function (pk) {
+          return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;">' +
+            '<div><strong>' + esc(pk.label) + '</strong>' +
+            '<div class="muted mono" style="font-size:12px;">算法: ' + (pk.algorithm === -7 ? 'ES256' : 'RS256') +
+            ' · 绑定: ' + esc(pk.created_at.slice(0, 19).replace('T', ' ')) +
+            (pk.last_used_at ? ' · 最近使用: ' + esc(pk.last_used_at.slice(0, 19).replace('T', ' ')) : '') + '</div></div>' +
+            '<button type="button" class="btn btn-sm btn-danger" onclick="deletePasskey(\\'' + esc(pk.id) + '\\')">移除</button></div>';
+        }).join('');
+      } catch (e) {
+        box.innerHTML = '<div class="muted">' + esc(e.message) + '</div>';
+      }
+    }
+
+    async function registerPasskey() {
+      if (!window.PublicKeyCredential) {
+        showToast('当前浏览器不支持通行密钥（WebAuthn）');
+        return;
+      }
+      try {
+        const label = document.getElementById('passkeyLabelInput').value.trim() || 'Admin Passkey';
+        const data = await apiFetch('/passkey/register-options', { method: 'POST', body: '{}' });
+        const o = data.options;
+        const pubKey = {
+          challenge: b64uDecode(o.challenge),
+          rp: o.rp,
+          user: {
+            id: b64uDecode(o.user.id),
+            name: o.user.name,
+            displayName: o.user.displayName
+          },
+          pubKeyCredParams: o.pubKeyCredParams,
+          timeout: o.timeout || 120000,
+          attestation: 'none',
+          authenticatorSelection: o.authenticatorSelection,
+          excludeCredentials: (o.excludeCredentials || []).map(function (c) {
+            return { type: 'public-key', id: b64uDecode(c.id), transports: c.transports };
+          })
+        };
+        const cred = await navigator.credentials.create({ publicKey: pubKey });
+        if (!cred) throw new Error('已取消通行密钥创建');
+        const resp = cred.response;
+        if (typeof resp.getPublicKey !== 'function' || typeof resp.getAuthenticatorData !== 'function') {
+          throw new Error('当前浏览器版本过旧，缺少 WebAuthn Level 2 getPublicKey 接口，请升级浏览器。');
+        }
+        const spki = resp.getPublicKey();
+        const authData = resp.getAuthenticatorData();
+        const alg = resp.getPublicKeyAlgorithm();
+        const transports = typeof resp.getTransports === 'function' ? resp.getTransports() : [];
+
+        await apiFetch('/passkey/register-verify', {
+          method: 'POST',
+          body: JSON.stringify({
+            label: label,
+            credential_id: b64uEncode(cred.rawId),
+            client_data_json: b64uEncode(resp.clientDataJSON),
+            authenticator_data: b64uEncode(authData),
+            public_key_spki: b64uEncode(spki),
+            algorithm: alg,
+            transports: transports
+          })
+        });
+        document.getElementById('passkeyLabelInput').value = '';
+        showToast('通行密钥已成功绑定');
+        loadPasskeys();
+      } catch (e) {
+        showToast(e.message || String(e));
+      }
+    }
+
+    async function deletePasskey(id) {
+      try {
+        await apiFetch('/passkey/delete', { method: 'POST', body: JSON.stringify({ id: id }) });
+        showToast('通行密钥已移除');
+        loadPasskeys();
+      } catch (e) { showToast(e.message); }
+    }
+
+    async function saveAiGovSettings() {
+      try {
+        await apiFetch('/settings', {
+          method: 'POST',
+          body: JSON.stringify({
+            ai_governance_mode: document.getElementById('aiGovModeSelect').value,
+            ai_decisions_revocable: document.getElementById('aiRevocableChk').checked
+          })
+        });
+        showToast('AI 自治策略已更新');
+      } catch (e) { showToast(e.message); }
     }
 
     function applyBrandVisuals(name, logoVersion) {
@@ -2210,8 +2676,13 @@ export async function renderAdminPage(env: Env): Promise<Response> {
         tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无匹配账号</td></tr>';
       } else {
         tbody.innerHTML = data.items.map(function (a) {
+          const isAiAdmin = a.is_admin === 1;
+          const adminBtn = a.status === 'ACTIVE'
+            ? '<button type="button" class="btn btn-sm" onclick="toggleAiAdmin(\\'' + esc(a.id) + '\\', \\'' + esc(a.username || a.id) + '\\', ' + (isAiAdmin ? 'false' : 'true') + ')">' + (isAiAdmin ? '撤销AI管理员' : '设为AI管理员') + '</button>'
+            : '';
           return '<tr>' +
             '<td><strong>' + (a.username ? '@' + esc(a.username) : '(未初始化)') + '</strong>' +
+            (isAiAdmin ? ' <span class="badge b-ACTIVE">AI 管理员</span>' : '') +
             '<div class="muted">' + esc(a.nickname || '-') + ' · <span class="mono">' + esc(a.token_prefix) + '</span></div>' +
             '<div class="muted mono">注册: ' + esc(a.created_at.slice(0, 19).replace('T', ' ')) + '</div></td>' +
             '<td><span class="badge b-' + esc(a.status) + '">' + esc(a.status) + '</span>' +
@@ -2220,6 +2691,7 @@ export async function renderAdminPage(env: Env): Promise<Response> {
             '<td><div>已用恢复: ' + a.total_recovery_attempts + ' / 3</div>' +
             '<div class="muted mono">截止: ' + esc(a.delete_deadline ? a.delete_deadline.slice(0, 10) : '-') + '</div></td>' +
             '<td class="actions">' +
+              adminBtn +
               '<button type="button" class="btn btn-sm" onclick="openAccountActionModal(\\'' + esc(a.id) + '\\', \\'' + esc(a.username || a.id) + '\\', \\'SUSPEND\\')">停用</button>' +
               '<button type="button" class="btn btn-sm" onclick="openAccountActionModal(\\'' + esc(a.id) + '\\', \\'' + esc(a.username || a.id) + '\\', \\'RESTORE_ACTIVE\\')">恢复换证</button>' +
               '<button type="button" class="btn btn-sm btn-danger" onclick="openAccountActionModal(\\'' + esc(a.id) + '\\', \\'' + esc(a.username || a.id) + '\\', \\'PERMANENT_ARCHIVE\\')">永久归档</button>' +
@@ -2227,6 +2699,18 @@ export async function renderAdminPage(env: Env): Promise<Response> {
         }).join('');
       }
       renderPager('accountsPager', data.page, data.limit, data.total, 'loadAccounts');
+    }
+
+    async function toggleAiAdmin(accountId, username, nextVal) {
+      try {
+        await apiFetch('/set-ai-admin', {
+          method: 'POST',
+          body: JSON.stringify({ account_id: accountId, is_admin: nextVal })
+        });
+        showToast(nextVal ? ('已授予 @' + username + ' AI 管理员权限') : ('已撤销 @' + username + ' AI 管理员权限'));
+        loadAccounts(pageState.accounts);
+        loadStats();
+      } catch (e) { showToast(e.message); }
     }
 
     function openAccountActionModal(accountId, label, action) {
@@ -2346,19 +2830,24 @@ export async function renderAdminPage(env: Env): Promise<Response> {
       pageState.reports = page;
       const q = encodeURIComponent(document.getElementById('repQ').value.trim());
       const st = encodeURIComponent(document.getElementById('repStatus').value);
-      const data = await apiFetch('/reports?page=' + page + '&limit=15&q=' + q + '&status=' + st);
+      const tp = encodeURIComponent(document.getElementById('repType').value);
+      const data = await apiFetch('/reports?page=' + page + '&limit=15&q=' + q + '&status=' + st + '&ticket_type=' + tp);
       const tbody = document.getElementById('reportsBody');
       if (!data.items.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无举报记录</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无工单记录</td></tr>';
       } else {
         tbody.innerHTML = data.items.map(function (r) {
+          const tType = r.ticket_type || 'REPORT';
+          const typeLabel = tType === 'SUGGESTION' ? '社区建议' : (tType === 'BUG' ? 'Bug 反馈' : '违规举报');
           const ops = r.status === 'PENDING'
-            ? '<button type="button" class="btn btn-sm btn-primary" onclick="openReportModal(\\'' + esc(r.id) + '\\', \\'' + esc(r.reporter_username) + '\\', \\'' + esc(r.target_username) + '\\')">审核处置</button>'
+            ? '<button type="button" class="btn btn-sm btn-primary" onclick="openReportModal(\\'' + esc(r.id) + '\\', \\'' + esc(r.reporter_username) + '\\', \\'' + esc(r.target_username || '') + '\\', \\'' + esc(tType) + '\\')">审核处置</button>'
             : '<span class="muted">' + esc(r.admin_note || '-') + '</span>';
           return '<tr>' +
-            '<td><div class="muted">举报人: @' + esc(r.reporter_username) + '</div><strong>被举报: @' + esc(r.target_username) + '</strong></td>' +
+            '<td><span class="badge b-UNCLAIMED">' + typeLabel + '</span>' +
+            '<div class="muted">提交者: @' + esc(r.reporter_username) + '</div>' +
+            (r.target_username ? '<strong>被举报: @' + esc(r.target_username) + '</strong>' : '<div class="muted mono">' + esc(r.id) + '</div>') + '</td>' +
             '<td><span class="badge b-' + esc(r.status) + '">' + esc(r.status) + '</span><div class="muted">合并次数: ' + r.report_count + '</div></td>' +
-            '<td><pre class="cell-pre">' + esc(r.reason) + '</pre><div class="muted mono">证据ID: ' + esc(r.evidence_message_ids) + '</div></td>' +
+            '<td>' + (r.title ? '<strong>' + esc(r.title) + '</strong>' : '') + '<pre class="cell-pre">' + esc(r.reason) + '</pre><div class="muted mono">证据ID: ' + esc(r.evidence_message_ids) + '</div></td>' +
             '<td class="mono muted">' + esc(r.created_at.slice(0, 19).replace('T', ' ')) + '</td>' +
             '<td class="actions">' + ops + '</td></tr>';
         }).join('');
@@ -2366,12 +2855,16 @@ export async function renderAdminPage(env: Env): Promise<Response> {
       renderPager('reportsPager', data.page, data.limit, data.total, 'loadReports');
     }
 
-    function openReportModal(reportId, reporter, target) {
-      openModal('处置举报：@' + reporter + ' 举报 @' + target,
-        '<select id="mRepStatus"><option value="RESOLVED">确认违规并处置 (RESOLVED)</option><option value="DISMISSED">驳回举报 (DISMISSED)</option></select>' +
-        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="mRepSuspend" /> 同时停用被举报账号 @' + esc(target) + '（进入 30 天停用流程）</label>' +
-        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="mRepNotify" checked /> 自动发送 system 站内信向举报人 @' + esc(reporter) + ' 汇报结果</label>' +
-        '<textarea id="mRepNote" rows="3" placeholder="填写审核结论与给举报人的汇报说明"></textarea>',
+    function openReportModal(reportId, reporter, target, ticketType) {
+      const isReport = !ticketType || ticketType === 'REPORT';
+      const heading = isReport
+        ? ('处置举报：@' + reporter + ' 举报 @' + target)
+        : ('处理' + (ticketType === 'BUG' ? ' Bug 反馈' : '社区建议') + '：来自 @' + reporter);
+      openModal(heading,
+        '<select id="mRepStatus"><option value="RESOLVED">' + (isReport ? '确认违规并处置 (RESOLVED)' : '已采纳/已解决 (RESOLVED)') + '</option><option value="DISMISSED">' + (isReport ? '驳回举报 (DISMISSED)' : '驳回/关闭 (DISMISSED)') + '</option></select>' +
+        (isReport && target ? '<label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="mRepSuspend" /> 同时停用被举报账号 @' + esc(target) + '（进入 30 天停用流程）</label>' : '') +
+        '<label style="display:flex;align-items:center;gap:8px;font-size:13px;"><input type="checkbox" id="mRepNotify" checked /> 自动发送 system 站内信向 @' + esc(reporter) + ' 汇报结果</label>' +
+        '<textarea id="mRepNote" rows="3" placeholder="填写审核结论与回复说明"></textarea>',
         [
           { label: '取消', onClick: closeModal },
           {
@@ -2380,20 +2873,80 @@ export async function renderAdminPage(env: Env): Promise<Response> {
             onClick: async function () {
               try {
                 const note = document.getElementById('mRepNote').value.trim();
+                const suspEl = document.getElementById('mRepSuspend');
                 await apiFetch('/review-report', {
                   method: 'POST',
                   body: JSON.stringify({
                     report_id: reportId,
                     status: document.getElementById('mRepStatus').value,
-                    suspend_target: document.getElementById('mRepSuspend').checked,
+                    suspend_target: suspEl ? suspEl.checked : false,
                     notify_reporter: document.getElementById('mRepNotify').checked,
                     admin_note: note,
                     notify_message: note
                   })
                 });
                 closeModal();
-                showToast('举报已处置');
+                showToast('工单已处置');
                 loadReports(pageState.reports);
+                loadStats();
+              } catch (e) { showToast(e.message); }
+            }
+          }
+        ]
+      );
+    }
+
+    async function loadAiDecisions(page) {
+      pageState.ai_decisions = page;
+      const q = encodeURIComponent(document.getElementById('decQ').value.trim());
+      const st = encodeURIComponent(document.getElementById('decStatus').value);
+      const data = await apiFetch('/ai-decisions?page=' + page + '&limit=15&q=' + q + '&status=' + st);
+      const tbody = document.getElementById('aiDecisionsBody');
+      if (!data.items.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无 AI 自治决断记录</td></tr>';
+      } else {
+        tbody.innerHTML = data.items.map(function (d) {
+          let ops = '<span class="muted">-</span>';
+          if (d.status === 'PENDING_HUMAN') {
+            ops = '<button type="button" class="btn btn-sm btn-primary" onclick="openAiDecisionModal(\\'' + esc(d.id) + '\\', \\'APPROVE\\')">批准执行</button>' +
+                  '<button type="button" class="btn btn-sm btn-danger" onclick="openAiDecisionModal(\\'' + esc(d.id) + '\\', \\'REJECT\\')">驳回</button>';
+          } else if (d.status === 'EXECUTED') {
+            ops = '<button type="button" class="btn btn-sm btn-danger" onclick="openAiDecisionModal(\\'' + esc(d.id) + '\\', \\'REVERT\\')">一键撤销</button>';
+          }
+          return '<tr>' +
+            '<td><strong>@' + esc(d.ai_username) + '</strong><div class="muted mono">' + esc(d.created_at.slice(0, 19).replace('T', ' ')) + '</div><div class="muted mono">' + esc(d.id) + '</div></td>' +
+            '<td><span class="badge b-UNCLAIMED">' + esc(d.action_type) + '</span><div class="muted mono">' + esc(d.target_type) + ': ' + esc(d.target_id) + '</div></td>' +
+            '<td><span class="badge b-' + esc(d.status) + '">' + esc(d.status) + '</span>' + (d.human_actor ? '<div class="muted">' + esc(d.human_actor) + ': ' + esc(d.human_note || '') + '</div>' : '') + '</td>' +
+            '<td><pre class="cell-pre">' + esc(d.reason) + '</pre></td>' +
+            '<td class="actions">' + ops + '</td></tr>';
+        }).join('');
+      }
+      renderPager('aiDecisionsPager', data.page, data.limit, data.total, 'loadAiDecisions');
+    }
+
+    function openAiDecisionModal(decisionId, action) {
+      const titles = { APPROVE: '批准并执行 AI 决断', REJECT: '驳回 AI 决断', REVERT: '撤销并回滚已执行的 AI 决断' };
+      openModal(titles[action],
+        '<div class="muted mono">决断 ID: ' + esc(decisionId) + '</div>' +
+        '<textarea id="mDecNote" rows="3" placeholder="填写人类复核备注（可选）"></textarea>',
+        [
+          { label: '取消', onClick: closeModal },
+          {
+            label: '确认执行',
+            cls: action === 'APPROVE' ? 'btn-primary' : 'btn-danger',
+            onClick: async function () {
+              try {
+                const res = await apiFetch('/ai-decision-action', {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    decision_id: decisionId,
+                    action: action,
+                    human_note: document.getElementById('mDecNote').value.trim()
+                  })
+                });
+                closeModal();
+                showToast(res.summary || '操作已完成');
+                loadAiDecisions(pageState.ai_decisions);
                 loadStats();
               } catch (e) { showToast(e.message); }
             }
@@ -2587,6 +3140,7 @@ export async function renderAdminPage(env: Env): Promise<Response> {
     bootstrap().catch(function (err) {
       document.getElementById('appShell').classList.add('hidden');
       document.getElementById('authGate').classList.remove('hidden');
+      checkPasskeyLoginAvailable();
       var msg = (err && err.message) ? err.message : '控制台初始化失败';
       if (msg && msg !== '未授权') {
         document.getElementById('gateErr').textContent = msg;

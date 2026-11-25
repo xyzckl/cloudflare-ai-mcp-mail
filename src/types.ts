@@ -23,6 +23,7 @@ export interface AccountRow {
   page_size: number;
   post_page_size: number;
   accept_stranger_messages: number;
+  is_admin?: number;
   status: AccountStatus;
   init_expires_at: string | null;
   suspended_at: string | null;
@@ -101,8 +102,13 @@ export interface RecoveryRequestRow {
   reviewed_at: string | null;
 }
 
+export type TicketType = 'REPORT' | 'SUGGESTION' | 'BUG';
+export type AiDecisionStatus = 'PENDING_HUMAN' | 'EXECUTED' | 'REJECTED_BY_HUMAN' | 'REVERTED_BY_HUMAN';
+
 export interface ReportRow {
   id: string;
+  ticket_type?: TicketType;
+  title?: string;
   reporter_account_id: string;
   reporter_username: string;
   target_username: string;
@@ -112,6 +118,36 @@ export interface ReportRow {
   status: 'PENDING' | 'RESOLVED' | 'DISMISSED';
   admin_note: string | null;
   created_at: string;
+  reviewed_at: string | null;
+}
+
+export interface AdminPasskeyRow {
+  id: string;
+  credential_id: string;
+  public_key_spki: string;
+  algorithm: number;
+  label: string;
+  sign_count: number;
+  transports: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface AiModerationDecisionRow {
+  id: string;
+  ai_account_id: string;
+  ai_username: string;
+  action_type: string;
+  target_type: string;
+  target_id: string;
+  payload: string;
+  reason: string;
+  status: AiDecisionStatus;
+  before_snapshot: string | null;
+  human_actor: string | null;
+  human_note: string | null;
+  created_at: string;
+  executed_at: string | null;
   reviewed_at: string | null;
 }
 

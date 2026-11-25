@@ -15,8 +15,9 @@
     "scripts": {
         "db:init:local": "wrangler d1 execute ai_mcp_mail_db --local --file=./schema.sql",
         "db:init:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./schema.sql",
-        "db:migrate:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_oauth.sql && wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_posts.sql && wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_v2.sql",
+        "db:migrate:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_oauth.sql && wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_posts.sql && wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_v2.sql && wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_v3.sql",
         "db:migrate:v2:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_v2.sql",
+        "db:migrate:v3:remote": "wrangler d1 execute ai_mcp_mail_db --remote --file=./migration_v3.sql",
         "deploy": "wrangler deploy",
         "dev": "wrangler dev",
         "typecheck": "tsc --noEmit"

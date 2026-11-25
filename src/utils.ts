@@ -241,22 +241,40 @@ export async function getEffectiveLimits(env: Env): Promise<EffectiveLimits> {
 let schemaV2Ensured = false;
 
 /**
- * 无损自动补齐 v2 表结构（幂等、只增不删，保障老服务器零停机无损升级）：
- * - 为 messages 补齐 reply_to_id、thread_id 字段及索引
- * - 创建 post_replies 表及索引
+ * 无损自动补齐 v2 + v3 表结构（幂等、只增不删，保障老服务器零停机无损升级）：
+ * - v2: messages 补齐 reply_to_id、thread_id；创建 post_replies 表
+ * - v3: accounts 补齐 is_admin；reports 补齐 ticket_type、title；创建 admin_passkeys、admin_passkey_challenges、ai_moderation_decisions 表
  */
 export async function ensureSchemaV2(env: Env): Promise<void> {
   if (schemaV2Ensured) return;
   try {
-    const cols = await env.DB.prepare('PRAGMA table_info(messages)').all<{ name: string }>();
-    const names = new Set((cols.results ?? []).map((c) => c.name));
-    if (!names.has('reply_to_id')) {
+    const [msgCols, accCols, repCols] = await Promise.all([
+      env.DB.prepare('PRAGMA table_info(messages)').all<{ name: string }>(),
+      env.DB.prepare('PRAGMA table_info(accounts)').all<{ name: string }>(),
+      env.DB.prepare('PRAGMA table_info(reports)').all<{ name: string }>(),
+    ]);
+    const msgNames = new Set((msgCols.results ?? []).map((c) => c.name));
+    if (!msgNames.has('reply_to_id')) {
       await env.DB.prepare('ALTER TABLE messages ADD COLUMN reply_to_id TEXT').run().catch(() => {});
     }
-    if (!names.has('thread_id')) {
+    if (!msgNames.has('thread_id')) {
       await env.DB.prepare('ALTER TABLE messages ADD COLUMN thread_id TEXT').run().catch(() => {});
     }
     await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_msg_thread ON messages(thread_id, created_at ASC)').run().catch(() => {});
+
+    const accNames = new Set((accCols.results ?? []).map((c) => c.name));
+    if (!accNames.has('is_admin')) {
+      await env.DB.prepare('ALTER TABLE accounts ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0').run().catch(() => {});
+    }
+
+    const repNames = new Set((repCols.results ?? []).map((c) => c.name));
+    if (!repNames.has('ticket_type')) {
+      await env.DB.prepare("ALTER TABLE reports ADD COLUMN ticket_type TEXT NOT NULL DEFAULT 'REPORT'").run().catch(() => {});
+    }
+    if (!repNames.has('title')) {
+      await env.DB.prepare("ALTER TABLE reports ADD COLUMN title TEXT NOT NULL DEFAULT ''").run().catch(() => {});
+    }
+
     await env.DB.prepare(
       `CREATE TABLE IF NOT EXISTS post_replies (
          id TEXT PRIMARY KEY,
@@ -273,6 +291,52 @@ export async function ensureSchemaV2(env: Env): Promise<void> {
     ).run().catch(() => {});
     await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_post_replies_post ON post_replies(post_id, status, created_at ASC)').run().catch(() => {});
     await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_post_replies_author ON post_replies(author_account_id, created_at DESC)').run().catch(() => {});
+
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS admin_passkeys (
+         id TEXT PRIMARY KEY,
+         credential_id TEXT UNIQUE NOT NULL,
+         public_key_spki TEXT NOT NULL,
+         algorithm INTEGER NOT NULL,
+         label TEXT NOT NULL DEFAULT 'Passkey',
+         sign_count INTEGER NOT NULL DEFAULT 0,
+         transports TEXT NOT NULL DEFAULT '[]',
+         created_at TEXT NOT NULL,
+         last_used_at TEXT
+       )`
+    ).run().catch(() => {});
+
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS admin_passkey_challenges (
+         challenge TEXT PRIMARY KEY,
+         purpose TEXT NOT NULL CHECK (purpose IN ('register', 'login')),
+         expires_at TEXT NOT NULL,
+         created_at TEXT NOT NULL
+       )`
+    ).run().catch(() => {});
+
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS ai_moderation_decisions (
+         id TEXT PRIMARY KEY,
+         ai_account_id TEXT NOT NULL,
+         ai_username TEXT NOT NULL,
+         action_type TEXT NOT NULL,
+         target_type TEXT NOT NULL,
+         target_id TEXT NOT NULL,
+         payload TEXT NOT NULL,
+         reason TEXT NOT NULL,
+         status TEXT NOT NULL CHECK (status IN ('PENDING_HUMAN', 'EXECUTED', 'REJECTED_BY_HUMAN', 'REVERTED_BY_HUMAN')),
+         before_snapshot TEXT,
+         human_actor TEXT,
+         human_note TEXT,
+         created_at TEXT NOT NULL,
+         executed_at TEXT,
+         reviewed_at TEXT
+       )`
+    ).run().catch(() => {});
+    await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ai_decisions_status ON ai_moderation_decisions(status, created_at DESC)').run().catch(() => {});
+    await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_ai_decisions_ai ON ai_moderation_decisions(ai_account_id, created_at DESC)').run().catch(() => {});
+
     schemaV2Ensured = true;
   } catch {
     // 忽略瞬时错误，下次请求再试
